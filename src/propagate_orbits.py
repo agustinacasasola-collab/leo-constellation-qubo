@@ -1,20 +1,33 @@
 """
 propagate_orbits.py
 -------------------
-Propagates TLE orbits using SGP4 and saves ECI state vectors.
+Propagates TLE orbits using SGP4 and stores GCRF cartesian state vectors.
 
-For each object in data/shell_550km.tle, computes position (km) and
-velocity (km/s) in the Earth-Centered Inertial (ECI) frame at regular
-time steps over a configurable simulation window.
+Produces two output files:
 
-Output: data/propagated_states.csv
-    norad_id, epoch_utc, x_km, y_km, z_km, vx_kms, vy_kms, vz_kms, altitude_km
+  data/propagated_candidates.csv
+      Full 3-day trajectory for each of the 20 Shell-3 candidate satellites.
+      Columns: norad_id, epoch_utc, x_km, y_km, z_km,
+               vx_kms, vy_kms, vz_kms, altitude_km, error
+      Rows: 20 candidates × 4321 timesteps (60 s step) = 86,420 rows.
 
-Also saves a ground-track plot to results/ground_tracks.png.
+  data/propagated_catalog.csv
+      One-row snapshot for every catalog object, propagated to the
+      simulation start epoch.  Used for altitude verification and
+      spatial distribution analysis.  The full catalog trajectory is
+      NOT stored (22,000 × 4,321 rows ≈ 95 M rows); compute_pc.py
+      propagates catalog objects on-the-fly via sgp4_array.
+      Columns: norad_id, x_km, y_km, z_km, vx_kms, vy_kms, vz_kms,
+               altitude_km, error
+
+Simulation parameters (Owens-Fahrner 2025, Section 4):
+    Duration  : 3 days (259,200 s)
+    Time step : 60 s
+    Frame     : GCRF (≈ ECI J2000 for SGP4 outputs)
 
 Usage:
     python src/propagate_orbits.py
-    python src/propagate_orbits.py --hours 12 --step 30
+    python src/propagate_orbits.py --days 3 --step 60
 """
 
 import argparse
@@ -30,472 +43,343 @@ from sgp4.api import Satrec, jday
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-TLE_PATH = Path(__file__).parent.parent / "data" / "shell_550km.tle"
-OUTPUT_CSV = Path(__file__).parent.parent / "data" / "propagated_states.csv"
-OUTPUT_PLOT = Path(__file__).parent.parent / "results" / "ground_tracks.png"
-OUTPUT_PLOT_FILTERED = Path(__file__).parent.parent / "results" / "ground_tracks_filtered.png"
+DATA_DIR = Path(__file__).parent.parent / "data"
+CANDIDATE_TLE_PATH = DATA_DIR / "shell_550km.tle"
+CATALOG_TLE_PATH   = DATA_DIR / "leo_catalog.tle"
+OUTPUT_CANDIDATES  = DATA_DIR / "propagated_candidates.csv"
+OUTPUT_CATALOG     = DATA_DIR / "propagated_catalog.csv"
+OUTPUT_PLOT        = Path(__file__).parent.parent / "results" / "ground_tracks.png"
 
-# Altitude filter bounds for the 550 km shell
-ALT_FILTER_MIN_KM = 540.0
-ALT_FILTER_MAX_KM = 560.0
+# Simulation defaults (Owens-Fahrner 2025, Section 4)
+DEFAULT_DAYS  = 3
+DEFAULT_STEP  = 60.0   # seconds
 
 # Earth constants
 EARTH_RADIUS_KM = 6371.0
 
 
 # ---------------------------------------------------------------------------
-# TLE parsing
+# TLE loading
 # ---------------------------------------------------------------------------
 
 def load_tles(tle_path: Path) -> list[dict]:
     """
-    Parse a TLE file and return a list of satellite records.
-
-    Each TLE object occupies exactly 2 lines (no name line in this format).
-    Lines starting with '1 ' are Line 1, lines starting with '2 ' are Line 2.
+    Parse a 2-line TLE file and return a list of satellite records.
 
     Parameters
     ----------
     tle_path : Path
-        Path to the .tle file.
 
     Returns
     -------
-    list of dict
-        Each dict has keys: 'norad_id' (str), 'line1' (str), 'line2' (str).
+    list of dict, each with 'norad_id', 'line1', 'line2'
     """
-    lines = [l.strip() for l in tle_path.read_text().splitlines() if l.strip()]
-
+    lines = [ln.strip() for ln in tle_path.read_text().splitlines() if ln.strip()]
     satellites = []
     for i in range(0, len(lines) - 1, 2):
-        line1 = lines[i]
-        line2 = lines[i + 1]
-        if not (line1.startswith('1 ') and line2.startswith('2 ')):
+        l1, l2 = lines[i], lines[i + 1]
+        if not (l1.startswith('1 ') and l2.startswith('2 ')):
             continue
-        norad_id = line1[2:7].strip()
-        satellites.append({'norad_id': norad_id, 'line1': line1, 'line2': line2})
-
+        satellites.append({
+            'norad_id': l1[2:7].strip(),
+            'line1': l1,
+            'line2': l2,
+        })
     return satellites
 
 
 # ---------------------------------------------------------------------------
-# SGP4 propagation
+# SGP4 propagation helpers
 # ---------------------------------------------------------------------------
 
-def propagate_satellite(
-    sat_record: dict,
+def build_time_arrays(
     start_time: datetime,
-    duration_hours: float,
+    duration_seconds: float,
     step_seconds: float,
-) -> list[dict]:
+) -> tuple[list[datetime], np.ndarray, np.ndarray]:
     """
-    Propagate one satellite over the simulation window using SGP4.
-
-    SGP4 is the standard analytical propagator for LEO objects. It models
-    the effects of Earth's oblateness (J2, J3, J4 zonal harmonics), atmospheric
-    drag, and solar/lunar perturbations. Accuracy degrades for TLEs older than
-    a few days; this is why we filter for EPOCH > now-30 in fetch_tles.py.
-
-    The output is in the ECI (Earth-Centered Inertial) frame:
-    - Origin: Earth's centre of mass
-    - X-axis: vernal equinox direction (fixed to stars, not rotating with Earth)
-    - Z-axis: Earth's north pole
-    - Y-axis: completes right-hand system
-
-    Parameters
-    ----------
-    sat_record : dict
-        Dict with keys 'norad_id', 'line1', 'line2'.
-    start_time : datetime
-        UTC start time for propagation (timezone-aware).
-    duration_hours : float
-        Total propagation window in hours.
-    step_seconds : float
-        Time step between state vector samples (seconds).
+    Build datetime and Julian-date arrays for sgp4_array calls.
 
     Returns
     -------
-    list of dict
-        One entry per time step, with keys:
-        norad_id, epoch_utc, x_km, y_km, z_km, vx_kms, vy_kms, vz_kms,
-        altitude_km, error (0 = success).
+    datetimes : list of datetime (UTC, timezone-aware)
+    jd_array  : ndarray, shape (T,) — integer Julian date parts
+    fr_array  : ndarray, shape (T,) — fractional Julian date parts
+    """
+    n_steps = int(duration_seconds / step_seconds) + 1
+    datetimes, jd_list, fr_list = [], [], []
+    for i in range(n_steps):
+        t = start_time + timedelta(seconds=i * step_seconds)
+        jd, fr = jday(t.year, t.month, t.day,
+                      t.hour, t.minute, t.second + t.microsecond / 1e6)
+        datetimes.append(t)
+        jd_list.append(jd)
+        fr_list.append(fr)
+    return datetimes, np.array(jd_list), np.array(fr_list)
+
+
+def propagate_satellite_full(
+    sat_record: dict,
+    datetimes: list[datetime],
+    jd_array: np.ndarray,
+    fr_array: np.ndarray,
+) -> list[dict]:
+    """
+    Propagate one satellite at all T timesteps via sgp4_array (vectorised).
+
+    Returns one dict per timestep with full state vector in GCRF (km, km/s).
     """
     satellite = Satrec.twoline2rv(sat_record['line1'], sat_record['line2'])
     norad_id = sat_record['norad_id']
 
-    num_steps = int(duration_hours * 3600 / step_seconds) + 1
-    results = []
+    errors, r_all, v_all = satellite.sgp4_array(jd_array, fr_array)
+    r_all = np.array(r_all)   # (T, 3)
+    v_all = np.array(v_all)   # (T, 3)
+    errors = np.array(errors)
 
-    for i in range(num_steps):
-        t = start_time + timedelta(seconds=i * step_seconds)
-
-        # Convert datetime to Julian Date (integer + fractional parts).
-        # SGP4 requires this split to preserve floating-point precision.
-        jd, fr = jday(
-            t.year, t.month, t.day,
-            t.hour, t.minute, t.second + t.microsecond / 1e6
-        )
-
-        # Propagate: returns error code, position (km), velocity (km/s).
-        # Error codes: 0 = OK, 1 = mean eccentricity out of range,
-        # 2 = mean motion < 0, 3 = pert elements < 0, 4 = semi-latus < 0,
-        # 5 = orbit decayed.
-        error, r, v = satellite.sgp4(jd, fr)
-
-        if error != 0:
-            # Skip decayed or invalid states but record the error.
-            results.append({
+    rows = []
+    for i, (t, err) in enumerate(zip(datetimes, errors)):
+        if err != 0:
+            rows.append({
                 'norad_id': norad_id,
                 'epoch_utc': t.isoformat(),
                 'x_km': np.nan, 'y_km': np.nan, 'z_km': np.nan,
                 'vx_kms': np.nan, 'vy_kms': np.nan, 'vz_kms': np.nan,
                 'altitude_km': np.nan,
-                'error': error,
+                'error': int(err),
             })
-            continue
+        else:
+            r = r_all[i]
+            v = v_all[i]
+            altitude_km = math.sqrt(r[0]**2 + r[1]**2 + r[2]**2) - EARTH_RADIUS_KM
+            rows.append({
+                'norad_id': norad_id,
+                'epoch_utc': t.isoformat(),
+                'x_km': r[0], 'y_km': r[1], 'z_km': r[2],
+                'vx_kms': v[0], 'vy_kms': v[1], 'vz_kms': v[2],
+                'altitude_km': altitude_km,
+                'error': 0,
+            })
+    return rows
 
-        # Altitude above Earth's surface (assumes spherical Earth).
-        altitude_km = math.sqrt(r[0]**2 + r[1]**2 + r[2]**2) - EARTH_RADIUS_KM
 
-        results.append({
+def propagate_satellite_snapshot(
+    sat_record: dict,
+    jd0: float,
+    fr0: float,
+) -> dict:
+    """
+    Propagate one satellite to a single epoch (snapshot).
+
+    Used to build the propagated_catalog.csv snapshot without storing
+    the full 3-day trajectory for every catalog object.
+
+    Returns one dict with the state at the given epoch, or error fields
+    if SGP4 fails.
+    """
+    satellite = Satrec.twoline2rv(sat_record['line1'], sat_record['line2'])
+    norad_id = sat_record['norad_id']
+    err, r, v = satellite.sgp4(jd0, fr0)
+
+    if err != 0:
+        return {
             'norad_id': norad_id,
-            'epoch_utc': t.isoformat(),
-            'x_km': r[0],
-            'y_km': r[1],
-            'z_km': r[2],
-            'vx_kms': v[0],
-            'vy_kms': v[1],
-            'vz_kms': v[2],
-            'altitude_km': altitude_km,
-            'error': 0,
-        })
+            'x_km': np.nan, 'y_km': np.nan, 'z_km': np.nan,
+            'vx_kms': np.nan, 'vy_kms': np.nan, 'vz_kms': np.nan,
+            'altitude_km': np.nan,
+            'error': err,
+        }
 
-    return results
+    altitude_km = math.sqrt(r[0]**2 + r[1]**2 + r[2]**2) - EARTH_RADIUS_KM
+    return {
+        'norad_id': norad_id,
+        'x_km': r[0], 'y_km': r[1], 'z_km': r[2],
+        'vx_kms': v[0], 'vy_kms': v[1], 'vz_kms': v[2],
+        'altitude_km': altitude_km,
+        'error': 0,
+    }
 
 
-def eci_to_geodetic(x: float, y: float, z: float) -> tuple[float, float]:
+# ---------------------------------------------------------------------------
+# Ground-track visualisation
+# ---------------------------------------------------------------------------
+
+def eci_to_lat_lon_approx(x: float, y: float, z: float) -> tuple[float, float]:
     """
-    Convert ECI position to geographic latitude and longitude.
-
-    Uses a simplified spherical Earth model (sufficient for ground-track
-    plotting; production code should use WGS-84 oblate spheroid).
-
-    This conversion requires knowing the Greenwich Sidereal Time (GST) to
-    rotate from ECI to ECEF (Earth-Centered, Earth-Fixed). Here we use a
-    simple approximation for visualisation purposes.
-
-    Parameters
-    ----------
-    x, y, z : float
-        ECI position components (km).
-
-    Returns
-    -------
-    tuple of (latitude_deg, longitude_deg)
+    Approximate ECI → latitude/longitude (no Earth-rotation correction).
+    Suitable for ground-track shape visualisation only.
     """
-    # Geocentric latitude (spherical approximation)
     r = math.sqrt(x**2 + y**2 + z**2)
     lat = math.degrees(math.asin(z / r))
-
-    # Longitude in ECI frame (not accounting for Earth rotation — approximate)
     lon = math.degrees(math.atan2(y, x))
-
     return lat, lon
 
 
-# ---------------------------------------------------------------------------
-# Altitude filter
-# ---------------------------------------------------------------------------
-
-def filter_by_mean_altitude(
-    df: pd.DataFrame,
-    alt_min_km: float = ALT_FILTER_MIN_KM,
-    alt_max_km: float = ALT_FILTER_MAX_KM,
-    max_count: int = 20,
-    center_km: float = 550.0,
-) -> pd.DataFrame:
-    """
-    Filter propagated states to keep satellites whose mean altitude falls
-    within [alt_min_km, alt_max_km], then select the ``max_count`` objects
-    whose mean altitude is closest to ``center_km``.
-
-    Selecting by proximity to the shell centre (550 km) is physically
-    motivated: it prioritises the objects most representative of the
-    congested Starlink shell, discarding those at the fringe of the band.
-
-    Mean altitude is computed from valid (error=0) time steps only.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Full propagated states DataFrame from propagate_all().
-    alt_min_km : float
-        Lower bound for mean altitude (km). Default 540.0.
-    alt_max_km : float
-        Upper bound for mean altitude (km). Default 560.0.
-    max_count : int
-        Maximum number of satellites to keep after filtering.
-        Selects the ``max_count`` objects nearest to ``center_km``.
-        Default 20.
-    center_km : float
-        Reference altitude for proximity ranking (km). Default 550.0.
-
-    Returns
-    -------
-    pd.DataFrame
-        Subset of df containing only rows belonging to the selected
-        satellites, ordered by proximity to center_km.
-    """
-    valid = df[df['error'] == 0]
-    mean_alts = valid.groupby('norad_id')['altitude_km'].mean()
-
-    # Step 1: band filter
-    in_band = mean_alts[
-        (mean_alts >= alt_min_km) & (mean_alts <= alt_max_km)
-    ]
-
-    # Step 2: rank by distance to shell centre, keep best max_count
-    ranked = in_band.reindex(
-        (in_band - center_km).abs().sort_values().index
-    )
-    selected = ranked.iloc[:max_count]
-
-    print()
-    print("=" * 60)
-    print("ALTITUDE FILTER  (mean altitude per satellite)")
-    print(f"  Band  : {alt_min_km} – {alt_max_km} km")
-    print(f"  Centre: {center_km} km  |  Keep closest: {max_count}")
-    print("=" * 60)
-    print(f"  {'NORAD ID':<12} {'Mean alt (km)':>15}  {'dist 550km':>10}  {'Status':>8}")
-    print(f"  {'-'*12} {'-'*15}  {'-'*10}  {'-'*8}")
-    for norad_id, mean_alt in mean_alts.sort_values().items():
-        delta = abs(mean_alt - center_km)
-        if norad_id not in in_band.index:
-            status = "out-band"
-        elif norad_id in selected.index:
-            status = "SELECTED"
-        else:
-            status = "trimmed"
-        print(f"  {norad_id:<12} {mean_alt:>15.2f}  {delta:>10.2f}  {status:>8}")
-
-    print()
-    print(f"  In band : {len(in_band)} / {len(mean_alts)} satellites")
-    print(f"  Selected: {len(selected)} (closest to {center_km} km)")
-    print(f"  NORAD IDs: {sorted(selected.index.tolist())}")
-    print("=" * 60)
-
-    return df[df['norad_id'].isin(selected.index)].copy()
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def plot_ground_tracks(
-    df: pd.DataFrame,
-    output_path: Path,
-    title_suffix: str = "",
-) -> None:
-    """
-    Plot approximate ground tracks for propagated objects.
-
-    Note: this uses ECI longitude directly (no Earth rotation correction),
-    so tracks are approximate — suitable for visualising orbital coverage
-    patterns but not precise geographic positions.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Propagated states (full or filtered) from propagate_all().
-    output_path : Path
-        Path to save the PNG figure.
-    title_suffix : str, optional
-        Text appended to the plot title (e.g. " — filtered 540-560 km").
-    """
+def plot_ground_tracks(df: pd.DataFrame, output_path: Path) -> None:
+    """Plot ground tracks for all candidate satellites."""
     valid = df[df['error'] == 0].copy()
-
-    # Compute geodetic coordinates
     lats, lons = [], []
     for _, row in valid.iterrows():
-        lat, lon = eci_to_geodetic(row['x_km'], row['y_km'], row['z_km'])
-        lats.append(lat)
-        lons.append(lon)
+        la, lo = eci_to_lat_lon_approx(row['x_km'], row['y_km'], row['z_km'])
+        lats.append(la)
+        lons.append(lo)
     valid = valid.copy()
     valid['lat'] = lats
     valid['lon'] = lons
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-
-    # --- Ground tracks ---
-    ax = axes[0]
+    fig, ax = plt.subplots(figsize=(14, 6))
     ax.set_facecolor('#0a0a1a')
     fig.patch.set_facecolor('#0a0a1a')
 
     norad_ids = valid['norad_id'].unique()
     colors = plt.cm.plasma(np.linspace(0.1, 0.9, len(norad_ids)))
-
     for norad_id, color in zip(norad_ids, colors):
-        subset = valid[valid['norad_id'] == norad_id]
-        ax.scatter(subset['lon'], subset['lat'], s=0.5, color=color, alpha=0.6)
+        sub = valid[valid['norad_id'] == norad_id]
+        ax.scatter(sub['lon'], sub['lat'], s=0.3, color=color, alpha=0.5)
 
     ax.set_xlim(-180, 180)
     ax.set_ylim(-90, 90)
-    ax.set_xlabel('Longitude (°)', color='white', fontsize=10)
-    ax.set_ylabel('Latitude (°)', color='white', fontsize=10)
+    ax.set_xlabel('Longitude (deg)', color='white')
+    ax.set_ylabel('Latitude (deg)', color='white')
     ax.set_title(
-        f'Approximate Ground Tracks — Shell 3 (~550 km)  |  '
-        f'{len(norad_ids)} objects{title_suffix}',
-        color='white', fontsize=12
+        f'Approximate Ground Tracks — Shell 3 ({len(norad_ids)} candidates, 3 days)',
+        color='white',
     )
     ax.tick_params(colors='white')
     ax.spines[:].set_color('white')
     ax.grid(True, alpha=0.2, color='white')
-    ax.axhline(0, color='white', alpha=0.3, linewidth=0.5)
-
-    # --- Altitude over time (first 6 objects) ---
-    ax2 = axes[1]
-    ax2.set_facecolor('#0a0a1a')
-
-    for norad_id, color in zip(norad_ids[:6], colors[:6]):
-        subset = valid[valid['norad_id'] == norad_id].copy()
-        subset = subset.reset_index(drop=True)
-        times_h = [i * (subset.index[1] if len(subset) > 1 else 1) for i in range(len(subset))]
-        # Use row index as time proxy (each row = one time step)
-        ax2.plot(subset.index, subset['altitude_km'],
-                 color=color, linewidth=1.0, label=f'NORAD {norad_id}')
-
-    ax2.set_xlabel('Time step', color='white', fontsize=10)
-    ax2.set_ylabel('Altitude (km)', color='white', fontsize=10)
-    ax2.set_title('Altitude vs Time (first 6 objects)', color='white', fontsize=11)
-    ax2.tick_params(colors='white')
-    ax2.spines[:].set_color('white')
-    ax2.grid(True, alpha=0.2, color='white')
-    ax2.legend(fontsize=7, facecolor='#1a1a2e', labelcolor='white',
-               loc='upper right')
-
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='#0a0a1a')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='#0a0a1a')
     plt.close()
     print(f"  Ground track plot saved to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Summary helpers
+# ---------------------------------------------------------------------------
+
+def print_candidate_summary(df: pd.DataFrame) -> None:
+    valid = df[df['error'] == 0]
+    print()
+    print("=" * 60)
+    print("CANDIDATE PROPAGATION SUMMARY")
+    print("=" * 60)
+    print(f"  Total state vectors : {len(df):,}")
+    print(f"  Valid               : {len(valid):,}")
+    print(f"  Errors / decayed    : {len(df) - len(valid):,}")
+    print()
+    print(f"  {'NORAD':>8}  {'Mean alt':>10}  {'Min alt':>8}  {'Max alt':>8}  {'Steps':>7}")
+    for norad_id, grp in valid.groupby('norad_id'):
+        print(f"  {norad_id:>8}  "
+              f"{grp['altitude_km'].mean():>10.1f}  "
+              f"{grp['altitude_km'].min():>8.1f}  "
+              f"{grp['altitude_km'].max():>8.1f}  "
+              f"{len(grp):>7,}")
+    print("=" * 60)
+
+
+def print_catalog_summary(df: pd.DataFrame) -> None:
+    valid = df[df['error'] == 0]
+    print()
+    print("=" * 60)
+    print("CATALOG SNAPSHOT SUMMARY")
+    print("=" * 60)
+    print(f"  Total objects       : {len(df):,}")
+    print(f"  Valid               : {len(valid):,}")
+    print(f"  Errors / decayed    : {len(df) - len(valid):,}")
+    alts = valid['altitude_km']
+    print(f"  Altitude range      : {alts.min():.0f} – {alts.max():.0f} km")
+    print(f"  Below 600 km        : {(alts < 600).sum():,}")
+    print(f"  600–1200 km         : {((alts >= 600) & (alts < 1200)).sum():,}")
+    print(f"  1200–2000 km        : {((alts >= 1200) & (alts <= 2000)).sum():,}")
+    print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def propagate_all(
-    tle_path: Path,
-    duration_hours: float,
-    step_seconds: float,
-) -> pd.DataFrame:
-    """
-    Propagate all TLE objects and return a combined DataFrame.
-
-    Parameters
-    ----------
-    tle_path : Path
-        Path to the .tle file.
-    duration_hours : float
-        Propagation window in hours.
-    step_seconds : float
-        Time step in seconds.
-
-    Returns
-    -------
-    pd.DataFrame
-        Combined state vectors for all objects.
-    """
-    satellites = load_tles(tle_path)
-    print(f"  Loaded {len(satellites)} TLE objects from {tle_path.name}")
-
-    start_time = datetime.now(timezone.utc)
-    print(f"  Start time (UTC): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Duration: {duration_hours} hours  |  Step: {step_seconds} s")
-    steps_per_sat = int(duration_hours * 3600 / step_seconds) + 1
-    print(f"  Time steps per object: {steps_per_sat}")
-    print(f"  Total state vectors: {len(satellites) * steps_per_sat:,}")
-    print()
-
-    all_rows = []
-    for i, sat in enumerate(satellites):
-        rows = propagate_satellite(sat, start_time, duration_hours, step_seconds)
-        valid = sum(1 for r in rows if r['error'] == 0)
-        errors = len(rows) - valid
-        status = f"ok={valid}" + (f" errors={errors}" if errors else "")
-        print(f"  [{i+1:02d}/{len(satellites)}] NORAD {sat['norad_id']}  {status}")
-        all_rows.extend(rows)
-
-    return pd.DataFrame(all_rows)
-
-
-def print_summary(df: pd.DataFrame) -> None:
-    """Print a statistical summary of the propagated states."""
-    valid = df[df['error'] == 0]
-    print()
-    print("=" * 60)
-    print("PROPAGATION SUMMARY")
-    print("=" * 60)
-    print(f"  Total state vectors : {len(df):,}")
-    print(f"  Valid               : {len(valid):,}")
-    print(f"  Errors / decayed    : {len(df) - len(valid):,}")
-    print()
-    print("  Altitude statistics (km):")
-    print(f"    Min  : {valid['altitude_km'].min():.2f}")
-    print(f"    Max  : {valid['altitude_km'].max():.2f}")
-    print(f"    Mean : {valid['altitude_km'].mean():.2f}")
-    print(f"    Std  : {valid['altitude_km'].std():.2f}")
-    print()
-    print("  Per-object altitude range:")
-    for norad_id, group in valid.groupby('norad_id'):
-        print(f"    NORAD {norad_id:>6}  "
-              f"alt = [{group['altitude_km'].min():.1f}, "
-              f"{group['altitude_km'].max():.1f}] km  "
-              f"mean = {group['altitude_km'].mean():.1f} km")
-    print("=" * 60)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Propagate TLE orbits with SGP4"
+        description="SGP4 orbit propagator — Owens-Fahrner 2025 pipeline"
     )
     parser.add_argument(
-        '--hours', type=float, default=24.0,
-        help='Propagation window in hours (default: 24)'
+        '--days', type=float, default=DEFAULT_DAYS,
+        help=f'Simulation duration in days (default: {DEFAULT_DAYS})'
     )
     parser.add_argument(
-        '--step', type=float, default=60.0,
-        help='Time step in seconds (default: 60)'
+        '--step', type=float, default=DEFAULT_STEP,
+        help=f'Time step in seconds (default: {DEFAULT_STEP:.0f})'
+    )
+    parser.add_argument(
+        '--no-catalog', action='store_true',
+        help='Skip catalog snapshot propagation (faster for candidate-only runs)'
     )
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("SGP4 Orbit Propagator — Shell 3 (~550 km)")
-    print("=" * 60)
+    duration_s = args.days * 86400.0
+    n_steps = int(duration_s / args.step) + 1
 
-    df = propagate_all(TLE_PATH, args.hours, args.step)
+    print("=" * 65)
+    print("SGP4 Orbit Propagator — Owens-Fahrner 2025")
+    print(f"  Duration  : {args.days} days  ({duration_s / 3600:.0f} h)")
+    print(f"  Time step : {args.step:.0f} s")
+    print(f"  Timesteps : {n_steps:,} per object")
+    print("=" * 65)
 
-    print_summary(df)
+    start_time = datetime.now(timezone.utc)
+    print(f"\n  Simulation start (UTC): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n  State vectors saved to: {OUTPUT_CSV}")
-
-    print("\nGenerating ground track plot (all objects)...")
-    plot_ground_tracks(df, OUTPUT_PLOT)
+    datetimes, jd_array, fr_array = build_time_arrays(start_time, duration_s, args.step)
+    jd0, fr0 = jd_array[0], fr_array[0]
 
     # ------------------------------------------------------------------
-    # Post-propagation altitude filter: keep only mean alt 540-560 km
+    # 1. Propagate candidates — full 3-day trajectory
     # ------------------------------------------------------------------
-    df_filtered = filter_by_mean_altitude(df)
+    print(f"\n--- Propagating candidates from {CANDIDATE_TLE_PATH.name} ---")
+    candidates = load_tles(CANDIDATE_TLE_PATH)
+    print(f"  Loaded {len(candidates)} candidate TLEs")
+    print(f"  Total state vectors: {len(candidates) * n_steps:,}")
 
-    print("\nGenerating ground track plot (filtered 540-560 km)...")
-    plot_ground_tracks(
-        df_filtered,
-        OUTPUT_PLOT_FILTERED,
-        title_suffix=f"  —  filtered {ALT_FILTER_MIN_KM:.0f}–{ALT_FILTER_MAX_KM:.0f} km",
-    )
+    candidate_rows = []
+    for i, sat in enumerate(candidates):
+        rows = propagate_satellite_full(sat, datetimes, jd_array, fr_array)
+        valid_n = sum(1 for r in rows if r['error'] == 0)
+        print(f"  [{i+1:02d}/{len(candidates)}] NORAD {sat['norad_id']}  "
+              f"valid={valid_n}/{n_steps}")
+        candidate_rows.extend(rows)
+
+    df_cand = pd.DataFrame(candidate_rows)
+    OUTPUT_CANDIDATES.parent.mkdir(parents=True, exist_ok=True)
+    df_cand.to_csv(OUTPUT_CANDIDATES, index=False)
+    print(f"\n  Saved {len(df_cand):,} rows to: {OUTPUT_CANDIDATES}")
+    print_candidate_summary(df_cand)
+
+    # ------------------------------------------------------------------
+    # 2. Propagate catalog — snapshot at simulation start epoch
+    # ------------------------------------------------------------------
+    if not args.no_catalog:
+        print(f"\n--- Propagating catalog snapshot from {CATALOG_TLE_PATH.name} ---")
+        catalog = load_tles(CATALOG_TLE_PATH)
+        print(f"  Loaded {len(catalog):,} catalog TLEs")
+        print(f"  Propagating to epoch {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC...")
+
+        catalog_rows = []
+        for sat in catalog:
+            catalog_rows.append(propagate_satellite_snapshot(sat, jd0, fr0))
+
+        df_cat = pd.DataFrame(catalog_rows)
+        OUTPUT_CATALOG.parent.mkdir(parents=True, exist_ok=True)
+        df_cat.to_csv(OUTPUT_CATALOG, index=False)
+        print(f"  Saved {len(df_cat):,} rows to: {OUTPUT_CATALOG}")
+        print_catalog_summary(df_cat)
+
+    # ------------------------------------------------------------------
+    # 3. Ground-track visualisation for candidates
+    # ------------------------------------------------------------------
+    print("\nGenerating ground track plot...")
+    plot_ground_tracks(df_cand, OUTPUT_PLOT)
 
     print("\nDone.")
 

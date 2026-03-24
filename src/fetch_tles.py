@@ -1,20 +1,25 @@
 """
 fetch_tles.py
 -------------
-Downloads TLE data from Space-Track.org for LEO objects near 550 km altitude.
+Downloads TLE data from Space-Track.org for Shell 3 candidates.
 
-Queries the GP class filtering by MEAN_MOTION between 15.04 and 15.12 rev/day,
-which corresponds to the ~540-560 km altitude band centered on the Starlink
-Shell 3 at 550 km — the most congested region in the current LEO environment.
+Targets the Owens-Fahrner et al. (2025) Shell 3 design parameters:
+    altitude    : 550 km
+    inclination : ~30 deg
 
-Derivation (vis-viva / Kepler's third law, circular orbit):
-    n = sqrt(GM / a^3)   [rad/s]
-    a = R_earth + h
-    GM = 398600.4418 km^3/s^2,  R_earth = 6371 km
+Mean-motion filter (Owens-Fahrner Table 2, Shell 3):
+    MEAN_MOTION_MIN = 15.14 rev/day
+    MEAN_MOTION_MAX = 15.22 rev/day
 
-    h = 540 km  →  a = 6911 km  →  n ≈ 15.11 rev/day
-    h = 550 km  →  a = 6921 km  →  n ≈ 15.08 rev/day
-    h = 560 km  →  a = 6931 km  →  n ≈ 15.05 rev/day
+Note on Kozai correction: SGP4 TLEs use the Kozai-corrected mean motion,
+which differs slightly from the Keplerian value.  For i = 30 deg the J2
+secular correction raises the TLE mean motion above the Keplerian value
+by ~0.06 rev/day, shifting the band from the pure-Kepler 15.08 rev/day
+to ~15.14 rev/day — consistent with the paper's filter.
+
+Inclination filter ±5 deg around 30 deg (25–35 deg) is added to isolate
+Shell 3 candidates and avoid contamination from higher-inclination shells
+in the same altitude band.
 
 Credentials are loaded from a .env file (never hardcoded):
     SPACETRACK_USER=your_email@example.com
@@ -37,11 +42,20 @@ from dotenv import load_dotenv
 LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 BASE_URL = "https://www.space-track.org"
 
-# MEAN_MOTION range for ~540-560 km altitude (rev/day)
-# Derived from vis-viva: n = sqrt(GM / a^3), converted to rev/day
-# h=560 km → 15.05 rev/day,  h=540 km → 15.11 rev/day
-MEAN_MOTION_MIN = 15.04  # slight margin below 560 km
-MEAN_MOTION_MAX = 15.12  # slight margin above 540 km
+# Owens-Fahrner 2025 Shell 3 parameters (Table 2):
+#   altitude 550 km, inclination 30 deg
+# MEAN_MOTION filter (Kozai-corrected TLE values for 550 km / 30 deg):
+#   Keplerian n at 550 km ≈ 15.08 rev/day
+#   J2 Kozai correction for i=30° adds ~+0.06 rev/day → ~15.14 rev/day
+MEAN_MOTION_MIN = 15.14   # lower bound (rev/day)
+MEAN_MOTION_MAX = 15.22   # upper bound (rev/day)
+
+# Inclination band centred on Shell 3 target of 30 deg (±5 deg)
+INCLINATION_MIN = 25.0    # deg
+INCLINATION_MAX = 35.0    # deg
+
+# Number of candidates to download (exactly 20 per the paper)
+N_CANDIDATES = 20
 
 OUTPUT_PATH = Path(__file__).parent.parent / "data" / "shell_550km.tle"
 
@@ -82,20 +96,21 @@ def load_credentials() -> tuple[str, str]:
     return user, password
 
 
-def build_query_url(limit: int = 20) -> str:
+def build_query_url(limit: int = N_CANDIDATES) -> str:
     """
-    Build the Space-Track GP query URL.
+    Build the Space-Track GP query URL for Shell 3 candidates.
 
-    Filters:
-    - MEAN_MOTION between MEAN_MOTION_MIN and MEAN_MOTION_MAX (550 km shell)
-    - EPOCH within the last 30 days (recent TLEs only)
+    Filters applied:
+    - MEAN_MOTION in [MEAN_MOTION_MIN, MEAN_MOTION_MAX]  (~550 km, Kozai-corrected)
+    - INCLINATION in [INCLINATION_MIN, INCLINATION_MAX]  (~30 deg ± 5 deg)
+    - EPOCH within the last 30 days (fresh TLEs only)
     - Ordered by NORAD_CAT_ID ascending
-    - Format: TLE (two-line element set, plain text)
+    - Format: TLE plain text
 
     Parameters
     ----------
     limit : int
-        Maximum number of TLE objects to return.
+        Maximum number of TLE objects to return. Default N_CANDIDATES (20).
 
     Returns
     -------
@@ -109,7 +124,8 @@ def build_query_url(limit: int = 20) -> str:
     url = (
         f"{BASE_URL}/basicspacedata/query/class/gp"
         f"/MEAN_MOTION/{MEAN_MOTION_MIN}--{MEAN_MOTION_MAX}"
-        f"/EPOCH/%3E{epoch_cutoff}"   # EPOCH > cutoff date
+        f"/INCLINATION/{INCLINATION_MIN}--{INCLINATION_MAX}"
+        f"/EPOCH/%3E{epoch_cutoff}"
         f"/orderby/NORAD_CAT_ID asc"
         f"/limit/{limit}"
         f"/format/tle"
@@ -199,14 +215,21 @@ def save_tles(tle_text: str, output_path: Path) -> int:
 
 def main() -> None:
     print("=" * 60)
-    print("Space-Track TLE Fetcher — Shell 3 (~550 km)")
-    print(f"MEAN_MOTION filter: {MEAN_MOTION_MIN} -- {MEAN_MOTION_MAX} rev/day")
+    print("Space-Track TLE Fetcher — Shell 3 (550 km / 30 deg)")
+    print(f"  MEAN_MOTION : {MEAN_MOTION_MIN} – {MEAN_MOTION_MAX} rev/day")
+    print(f"  INCLINATION : {INCLINATION_MIN} – {INCLINATION_MAX} deg")
+    print(f"  Candidates  : {N_CANDIDATES}")
     print("=" * 60)
 
-    tle_text = fetch_tles(limit=30)
+    tle_text = fetch_tles(limit=N_CANDIDATES)
     num_saved = save_tles(tle_text, OUTPUT_PATH)
 
-    print(f"\n  Saved {num_saved} TLE objects to: {OUTPUT_PATH}")
+    if num_saved < N_CANDIDATES:
+        print(f"\n  WARNING: only {num_saved}/{N_CANDIDATES} objects returned.")
+        print("  Space-Track may have fewer objects in this MEAN_MOTION + INCLINATION band.")
+        print("  Consider widening MEAN_MOTION or INCLINATION ranges in fetch_tles.py.")
+    else:
+        print(f"\n  Saved {num_saved} TLE objects to: {OUTPUT_PATH}")
     print("Done.")
 
 

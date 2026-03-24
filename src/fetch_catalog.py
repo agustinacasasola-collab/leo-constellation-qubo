@@ -1,15 +1,15 @@
 """
 fetch_catalog.py
 ----------------
-Downloads the full LEO catalog from Space-Track.org.
+Downloads the full conjunction-threat catalog from Space-Track.org.
 
-Queries all objects with MEAN_MOTION > 11.25 rev/day, corresponding to
-altitudes below ~1000 km (Low Earth Orbit). This includes active satellites,
-rocket bodies, and debris fragments — the complete threat environment for
-conjunction analysis.
+Filter criteria (Owens-Fahrner et al. 2025):
+    APOAPSIS  < 2000 km   — keeps all objects whose highest point is below
+                             2000 km, capturing the complete LEO threat environment
+                             while excluding MEO/GEO objects
+    ECCENTRICITY < 1.0    — bound orbits only (hyperbolic objects excluded)
 
-MEAN_MOTION > 11.25 rev/day derivation (circular orbit approximation):
-    h = 1000 km  →  a = 7371 km  →  n ≈ 11.25 rev/day
+Expected yield: ~22,000+ objects (active satellites, rocket bodies, debris).
 
 Credentials are loaded from the .env file in the project root:
     SPACETRACK_USER=your_email@example.com
@@ -32,8 +32,9 @@ from dotenv import load_dotenv
 LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 BASE_URL = "https://www.space-track.org"
 
-# Minimum mean motion for LEO (objects below ~1000 km)
-MEAN_MOTION_MIN = 11.25
+# Catalog filter thresholds (Owens-Fahrner 2025)
+APOAPSIS_MAX_KM = 2000.0   # apogee altitude upper bound (km)
+ECCENTRICITY_MAX = 1.0     # eccentricity upper bound (bound orbits only)
 
 OUTPUT_PATH = Path(__file__).parent.parent / "data" / "leo_catalog.tle"
 
@@ -71,14 +72,17 @@ def load_credentials() -> tuple[str, str]:
 
 def build_query_url() -> str:
     """
-    Build the Space-Track GP query URL for the full LEO catalog.
+    Build the Space-Track GP query URL for the conjunction-threat catalog.
 
-    Filters:
-    - MEAN_MOTION > 11.25 rev/day (altitude below ~1000 km)
-    - EPOCH within the last 30 days (recent TLEs only)
-    - Ordered by NORAD_CAT_ID ascending
-    - No limit (downloads all available objects)
+    Filters (Owens-Fahrner 2025):
+    - APOAPSIS < 2000 km     — apogee altitude below 2000 km (LEO + upper LEO)
+    - ECCENTRICITY < 1.0     — bound orbits only
+    - EPOCH within last 30 days — recent TLEs only
+    - No limit (downloads all matching objects; expected ~22,000+)
     - Format: TLE
+
+    Space-Track URL encoding:
+        %3C = '<'   (APOAPSIS less-than filter)
 
     Returns
     -------
@@ -91,8 +95,9 @@ def build_query_url() -> str:
 
     url = (
         f"{BASE_URL}/basicspacedata/query/class/gp"
-        f"/MEAN_MOTION/%3E{MEAN_MOTION_MIN}"   # MEAN_MOTION > 11.25
-        f"/EPOCH/%3E{epoch_cutoff}"             # EPOCH > cutoff date
+        f"/APOAPSIS/%3C{APOAPSIS_MAX_KM:.0f}"       # APOAPSIS < 2000 km
+        f"/ECCENTRICITY/%3C{ECCENTRICITY_MAX:.1f}"  # ECCENTRICITY < 1.0
+        f"/EPOCH/%3E{epoch_cutoff}"
         f"/orderby/NORAD_CAT_ID asc"
         f"/format/tle"
     )
@@ -178,8 +183,9 @@ def save_catalog(tle_text: str, output_path: Path) -> int:
 
 def main() -> None:
     print("=" * 60)
-    print("Space-Track Full LEO Catalog Downloader")
-    print(f"MEAN_MOTION filter: > {MEAN_MOTION_MIN} rev/day (alt < ~1000 km)")
+    print("Space-Track Catalog Downloader (Owens-Fahrner 2025)")
+    print(f"  APOAPSIS    < {APOAPSIS_MAX_KM:.0f} km")
+    print(f"  ECCENTRICITY < {ECCENTRICITY_MAX:.1f}")
     print("=" * 60)
 
     tle_text = fetch_catalog()
@@ -189,6 +195,9 @@ def main() -> None:
     print(f"\n  Total objects downloaded : {num_saved:,}")
     print(f"  File size                : {size_mb:.2f} MB")
     print(f"  Saved to                 : {OUTPUT_PATH}")
+    if num_saved < 20000:
+        print(f"\n  NOTE: expected ~22,000+ objects; got {num_saved:,}.")
+        print("  Check EPOCH cutoff or Space-Track catalog freshness.")
     print("\nDone.")
 
 
