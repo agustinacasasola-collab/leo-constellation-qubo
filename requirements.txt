@@ -1,0 +1,9 @@
+dwave-ocean-sdk
+dwave-samplers
+networkx
+numpy
+pandas
+matplotlib
+seaborn
+jupyter
+scipy
