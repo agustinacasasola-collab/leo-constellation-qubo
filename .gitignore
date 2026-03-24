@@ -51,6 +51,10 @@ coverage.xml
 dwave.conf
 .env
 
+# Space-Track credentials and downloaded data
+data/
+!data/sample_satellites.csv
+
 # Results (keep .gitkeep)
 results/*.csv
 results/*.png

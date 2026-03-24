@@ -1,9 +1,12 @@
+requests
+python-dotenv
+sgp4
+numpy
+matplotlib
 dwave-ocean-sdk
 dwave-samplers
 networkx
-numpy
 pandas
-matplotlib
 seaborn
 jupyter
 scipy

@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         '--quantum', action='store_true',
         help='Attempt quantum annealing via D-Wave Leap (requires dwave config create)'
     )
+    parser.add_argument(
+        '--data', type=str, default='sample',
+        choices=['sample', 'real'],
+        help="Dataset to use: 'sample' (synthetic, default) or 'real' (SGP4-derived Pc + TLE coverage)"
+    )
     return parser.parse_args()
 
 
@@ -145,13 +150,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1. Load satellite data
     # ------------------------------------------------------------------
-    data_path = os.path.join(os.path.dirname(__file__), 'data', 'sample_satellites.csv')
+    if args.data == 'real':
+        data_file = 'real_satellites.csv'
+    else:
+        data_file = 'sample_satellites.csv'
+    data_path = os.path.join(os.path.dirname(__file__), 'data', data_file)
     print(f"\nLoading satellite data from: {data_path}")
     satellites_df = pd.read_csv(data_path)
-    print(satellites_df.to_string(index=False))
+    satellites_df['satellite_id'] = satellites_df['satellite_id'].astype(str)
+    print(satellites_df[['satellite_id', 'pc', 'coverage']].to_string(index=False))
     print(f"\n  {len(satellites_df)} candidate satellites loaded.")
-    print(f"  Shells: {sorted(satellites_df['shell'].unique())}")
-    print(f"  Pc range: [{satellites_df['pc'].min():.4f}, {satellites_df['pc'].max():.4f}]")
+    if 'shell' in satellites_df.columns:
+        print(f"  Shells: {sorted(satellites_df['shell'].unique())}")
+    print(f"  Pc range     : [{satellites_df['pc'].min():.3e}, {satellites_df['pc'].max():.3e}]")
     print(f"  Coverage range: [{satellites_df['coverage'].min():.4f}, "
           f"{satellites_df['coverage'].max():.4f}]")
 
@@ -213,7 +224,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     results_dir = os.path.join(os.path.dirname(__file__), 'results')
     os.makedirs(results_dir, exist_ok=True)
-    csv_path = os.path.join(results_dir, 'solutions.csv')
+    suffix = f'_{args.data}'
+    csv_path = os.path.join(results_dir, f'solutions{suffix}.csv')
     all_results = [results_sa, results_tabu]
     if results_qa is not None:
         all_results.append(results_qa)
@@ -223,7 +235,7 @@ def main() -> None:
     # 9. Graph visualisation
     # ------------------------------------------------------------------
     print("\nGenerating graph visualisation...")
-    png_path = os.path.join(results_dir, 'graph_visualization.png')
+    png_path = os.path.join(results_dir, f'graph_visualization{suffix}.png')
     plot_graph(G, results_sa['selected_satellites'], png_path)
 
     print("\nDone.")
