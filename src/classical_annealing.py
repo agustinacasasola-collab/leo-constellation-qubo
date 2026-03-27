@@ -32,6 +32,11 @@ try:
 except ImportError:
     from tabu import TabuSampler  # fallback
 
+try:
+    from dwave.samplers import PathIntegralAnnealingSampler
+except ImportError:
+    PathIntegralAnnealingSampler = None
+
 from config.settings import SA_NUM_READS, SA_NUM_SWEEPS
 
 
@@ -63,7 +68,8 @@ def filter_feasible(
     """
     feasible = []
     for sample, energy in sampleset.data(['sample', 'energy']):
-        num_selected = sum(sample.values())
+        # Cast to Python int to avoid numpy int8 overflow at N > 127
+        num_selected = sum(int(v) for v in sample.values())
         if num_selected == k:
             feasible.append((dict(sample), energy))
 
@@ -242,6 +248,62 @@ def solve_tabu(
     }
 
 
+def solve_sqa(
+    bqm: dimod.BinaryQuadraticModel,
+    node_idx: Dict[str, int],
+    k: int,
+    num_reads: int = 100,
+    num_sweeps: int = SA_NUM_SWEEPS,
+) -> Dict:
+    """
+    Solve the QUBO using PathIntegralAnnealingSampler (simulated QA).
+
+    Simulates quantum annealing via path-integral Monte Carlo, modelling the
+    transverse-field Ising Hamiltonian. The Gamma (transverse field) is
+    annealed from a large value (strong quantum fluctuations) to zero
+    (classical ground state), analogous to hardware quantum annealing.
+
+    Returns the same dict format as solve_simulated_annealing, with
+    ``solver`` = ``'sqa_path_integral'``.
+
+    Raises
+    ------
+    RuntimeError
+        If PathIntegralAnnealingSampler is not available or no feasible
+        solution was found.
+    """
+    if PathIntegralAnnealingSampler is None:
+        raise RuntimeError(
+            "PathIntegralAnnealingSampler not available. "
+            "Install dwave-samplers >= 1.0: pip install dwave-samplers"
+        )
+
+    sampler = PathIntegralAnnealingSampler()
+    sampleset = sampler.sample(bqm, num_reads=num_reads, num_sweeps=num_sweeps)
+
+    feasible = filter_feasible(sampleset, node_idx, k)
+    num_feasible = len(feasible)
+    feasibility_rate = num_feasible / num_reads
+
+    if not feasible:
+        raise RuntimeError(
+            f"SQA (path integral) found no feasible solution (k={k}) in "
+            f"{num_reads} reads. Try increasing num_reads or num_sweeps."
+        )
+
+    best_sample, best_energy = feasible[0]
+    selected_satellites = decode_solution(best_sample, node_idx)
+
+    return {
+        'selected_satellites': selected_satellites,
+        'best_energy': best_energy,
+        'num_feasible': num_feasible,
+        'feasibility_rate': feasibility_rate,
+        'sampleset': sampleset,
+        'solver': 'sqa_path_integral',
+    }
+
+
 def print_results(results: Dict, satellites_df) -> None:
     """
     Print a formatted results table for a solved constellation.
@@ -265,8 +327,6 @@ def print_results(results: Dict, satellites_df) -> None:
     print("=" * 60)
     print(f"RESULTS — {solver_name}")
     print("=" * 60)
-    print(f"  {'Satellite':<14} {'Pc':>8} {'Coverage':>10}")
-    print(f"  {'-'*14} {'-'*8} {'-'*10}")
 
     pc_vals = []
     cov_vals = []
@@ -275,7 +335,21 @@ def print_results(results: Dict, satellites_df) -> None:
         cov = sat_lookup[sat_id]['coverage']
         pc_vals.append(pc)
         cov_vals.append(cov)
-        print(f"  {sat_id:<14} {pc:>8.4f} {cov:>10.4f}")
+
+    # Print per-satellite table only for small constellations (k ≤ 20).
+    if len(selected) <= 20:
+        print(f"  {'Satellite':<14} {'Pc':>8} {'Coverage':>10}")
+        print(f"  {'-'*14} {'-'*8} {'-'*10}")
+        for sat_id in sorted(selected):
+            pc = sat_lookup[sat_id]['pc']
+            cov = sat_lookup[sat_id]['coverage']
+            print(f"  {sat_id:<14} {pc:>8.4f} {cov:>10.4f}")
+    else:
+        nz = sum(1 for p in pc_vals if p > 0)
+        top5 = sorted(pc_vals, reverse=True)[:5]
+        print(f"  Selected {len(selected)} satellites  "
+              f"(Pc>0: {nz}, Pc=0: {len(selected)-nz})")
+        print(f"  Top-5 individual Pc : {[f'{p:.3e}' for p in top5]}")
 
     print()
     print(f"  Best energy        : {results['best_energy']:.6f}")

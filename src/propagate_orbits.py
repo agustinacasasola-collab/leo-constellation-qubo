@@ -3,42 +3,54 @@ propagate_orbits.py
 -------------------
 Propagates TLE orbits using SGP4 and stores GCRF cartesian state vectors.
 
-Produces two output files:
+Two operating modes selected by the --synthetic flag:
 
+  Default mode (real TLEs, Owens-Fahrner 2025 pipeline)
+  -------------------------------------------------------
   data/propagated_candidates.csv
-      Full 3-day trajectory for each of the 20 Shell-3 candidate satellites.
+      Full 3-day trajectory for Shell-3 real candidates.
       Columns: norad_id, epoch_utc, x_km, y_km, z_km,
                vx_kms, vy_kms, vz_kms, altitude_km, error
-      Rows: 20 candidates × 4321 timesteps (60 s step) = 86,420 rows.
+      Rows: N_candidates x 4321 timesteps (60 s step).
 
   data/propagated_catalog.csv
-      One-row snapshot for every catalog object, propagated to the
-      simulation start epoch.  Used for altitude verification and
-      spatial distribution analysis.  The full catalog trajectory is
-      NOT stored (22,000 × 4,321 rows ≈ 95 M rows); compute_pc.py
-      propagates catalog objects on-the-fly via sgp4_array.
+      One-row snapshot for every catalog object at simulation start.
       Columns: norad_id, x_km, y_km, z_km, vx_kms, vy_kms, vz_kms,
                altitude_km, error
+
+  Synthetic mode  (--synthetic, Arnas 2021 Shell 3 full constellation)
+  ----------------------------------------------------------------------
+  Reads:   data/shell3_synthetic.tle  (1,656 satellites, NORAD 90001-91656)
+  Writes:  data/propagated_candidates.csv   <-- OVERWRITES the default file
+  Columns: norad_id, timestep, x_km, y_km, z_km
+  Rows:    1,656 x 4,321 = 7,152,696
+
+  Uses SatrecArray for fully vectorised propagation (N x T in one NumPy
+  call per batch) and tqdm for a live progress bar.
 
 Simulation parameters (Owens-Fahrner 2025, Section 4):
     Duration  : 3 days (259,200 s)
     Time step : 60 s
-    Frame     : GCRF (≈ ECI J2000 for SGP4 outputs)
+    Frame     : GCRF (approx ECI J2000 for SGP4 outputs)
 
 Usage:
     python src/propagate_orbits.py
     python src/propagate_orbits.py --days 3 --step 60
+    python src/propagate_orbits.py --synthetic
+    python src/propagate_orbits.py --synthetic --batch-size 300
 """
 
 import argparse
 import math
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from sgp4.api import Satrec, jday
+from sgp4.api import Satrec, SatrecArray, jday
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -46,6 +58,7 @@ from sgp4.api import Satrec, jday
 DATA_DIR = Path(__file__).parent.parent / "data"
 CANDIDATE_TLE_PATH = DATA_DIR / "shell_550km.tle"
 CATALOG_TLE_PATH   = DATA_DIR / "leo_catalog.tle"
+SYNTHETIC_TLE_PATH = DATA_DIR / "shell3_synthetic.tle"   # Arnas 2021 constellation
 OUTPUT_CANDIDATES  = DATA_DIR / "propagated_candidates.csv"
 OUTPUT_CATALOG     = DATA_DIR / "propagated_catalog.csv"
 OUTPUT_PLOT        = Path(__file__).parent.parent / "results" / "ground_tracks.png"
@@ -53,6 +66,10 @@ OUTPUT_PLOT        = Path(__file__).parent.parent / "results" / "ground_tracks.p
 # Simulation defaults (Owens-Fahrner 2025, Section 4)
 DEFAULT_DAYS  = 3
 DEFAULT_STEP  = 60.0   # seconds
+
+# Batch size for SatrecArray vectorised propagation (--synthetic mode).
+# 200 satellites x 4321 timesteps x 3 coords x 8 bytes ~ 20 MB per batch.
+DEFAULT_BATCH_SIZE = 200
 
 # Earth constants
 EARTH_RADIUS_KM = 6371.0
@@ -297,12 +314,168 @@ def print_catalog_summary(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Vectorised synthetic propagation  (--synthetic mode)
+# ---------------------------------------------------------------------------
+
+def propagate_synthetic_vectorized(
+    tle_path: Path,
+    output_path: Path,
+    duration_days: float,
+    step_seconds: float,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[int, float, float, float]:
+    """
+    Propagate a large synthetic TLE constellation using SatrecArray.
+
+    Strategy
+    --------
+    Satellites are processed in batches of `batch_size`.  For each batch,
+    SatrecArray.sgp4(jd_array, fr_array) propagates all batch satellites
+    simultaneously in a single NumPy call, returning arrays of shape
+    (batch_n, T, 3).  The results are reshaped into a DataFrame and
+    streamed to the output CSV (append mode) to avoid holding the full
+    7 M-row dataset in memory at once.
+
+    Parameters
+    ----------
+    tle_path : Path
+        Input TLE file (e.g. shell3_synthetic.tle).
+    output_path : Path
+        Destination CSV (norad_id, timestep, x_km, y_km, z_km).
+    duration_days : float
+        Simulation duration in days.
+    step_seconds : float
+        Propagation timestep in seconds.
+    batch_size : int
+        Number of satellites per SatrecArray call.
+
+    Returns
+    -------
+    n_errors : int
+        Total SGP4 error count across all satellites and timesteps.
+    alt_min : float
+        Minimum altitude (km) over all valid positions.
+    alt_max : float
+        Maximum altitude (km) over all valid positions.
+    elapsed : float
+        Wall-clock propagation time in seconds.
+    """
+    # --- Load TLEs --------------------------------------------------------
+    sat_records = load_tles(tle_path)
+    N = len(sat_records)
+
+    norad_ids = np.array([int(s['norad_id']) for s in sat_records], dtype=np.int32)
+    satrecs   = [Satrec.twoline2rv(s['line1'], s['line2']) for s in sat_records]
+
+    # --- Build time arrays anchored to the TLE epoch ----------------------
+    # Using datetime.now() would create a mismatch between timestep indices
+    # stored in propagated_candidates.csv and the jd_array built in
+    # compute_pc.py from the TLE epoch.  Anchor t=0 to the TLE epoch instead.
+    duration_s = duration_days * 86400.0
+    T          = int(duration_s / step_seconds) + 1   # 4321 for 3d/60s
+
+    l1_ref     = sat_records[0]['line1']
+    y2_ref     = int(l1_ref[18:20])
+    doy_ref    = float(l1_ref[20:32])
+    year_ref   = (2000 + y2_ref) if y2_ref < 57 else (1900 + y2_ref)
+    start_time = (datetime(year_ref, 1, 1, tzinfo=timezone.utc)
+                  + timedelta(days=doy_ref - 1.0))
+
+    _, jd_array, fr_array = build_time_arrays(start_time, duration_s, step_seconds)
+    jd_array = jd_array.astype(np.float64)
+    fr_array = fr_array.astype(np.float64)
+
+    # --- Streaming CSV write ----------------------------------------------
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        f.write('norad_id,timestep,x_km,y_km,z_km\n')
+
+    # Timestep index column, shared across batches
+    ts_tile = np.tile(np.arange(T, dtype=np.int32), batch_size)  # pre-alloc max
+
+    n_errors = 0
+    alt_min  =  math.inf
+    alt_max  = -math.inf
+    t0 = time.perf_counter()
+
+    n_batches = math.ceil(N / batch_size)
+    pbar = tqdm(
+        range(0, N, batch_size),
+        total=n_batches,
+        desc='Propagating',
+        unit='batch',
+        ncols=72,
+    )
+
+    for batch_start in pbar:
+        batch_end    = min(batch_start + batch_size, N)
+        b_n          = batch_end - batch_start          # satellites this batch
+        b_satrecs    = satrecs[batch_start:batch_end]
+        b_norads     = norad_ids[batch_start:batch_end] # shape (b_n,)
+
+        # -------------------------------------------------------------------
+        # SatrecArray.sgp4 — fully vectorised:
+        #   e  shape (b_n, T)   error codes (0 = success)
+        #   r  shape (b_n, T, 3) GCRF positions in km
+        #   v  shape (b_n, T, 3) GCRF velocities in km/s  (unused here)
+        # -------------------------------------------------------------------
+        sat_arr = SatrecArray(b_satrecs)
+        e_batch, r_batch, _ = sat_arr.sgp4(jd_array, fr_array)
+
+        r_np = np.asarray(r_batch, dtype=np.float64)   # (b_n, T, 3)
+        e_np = np.asarray(e_batch, dtype=np.int32)     # (b_n, T)
+
+        # Accumulate error count
+        n_errors += int((e_np != 0).sum())
+
+        # Altitude stats (vectorised, valid rows only)
+        if e_np.size > 0:
+            r_flat = r_np.reshape(-1, 3)               # (b_n*T, 3)
+            e_flat = e_np.ravel()                      # (b_n*T,)
+            valid  = e_flat == 0
+            if valid.any():
+                alts = np.linalg.norm(r_flat[valid], axis=1) - EARTH_RADIUS_KM
+                if alts.min() < alt_min:
+                    alt_min = float(alts.min())
+                if alts.max() > alt_max:
+                    alt_max = float(alts.max())
+
+        # -------------------------------------------------------------------
+        # Build output columns — no Python loops
+        #   norad column: each norad ID repeated T times
+        #   ts column:    timestep indices 0..T-1 tiled b_n times
+        # -------------------------------------------------------------------
+        norad_col = np.repeat(b_norads, T)             # (b_n*T,)
+        ts_col    = ts_tile[:b_n * T]                  # slice pre-allocated tile
+        x_col     = r_np[:, :, 0].ravel()
+        y_col     = r_np[:, :, 1].ravel()
+        z_col     = r_np[:, :, 2].ravel()
+
+        df_batch = pd.DataFrame({
+            'norad_id': norad_col,
+            'timestep': ts_col,
+            'x_km':     x_col,
+            'y_km':     y_col,
+            'z_km':     z_col,
+        })
+
+        # Append to CSV (no header — already written above)
+        df_batch.to_csv(output_path, mode='a', index=False, header=False,
+                        float_format='%.4f')
+
+        pbar.set_postfix({'sats': f'{batch_end}/{N}', 'errs': n_errors})
+
+    elapsed = time.perf_counter() - t0
+    return n_errors, alt_min, alt_max, elapsed
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SGP4 orbit propagator — Owens-Fahrner 2025 pipeline"
+        description="SGP4 orbit propagator — Owens-Fahrner 2025 / Arnas 2021"
     )
     parser.add_argument(
         '--days', type=float, default=DEFAULT_DAYS,
@@ -314,13 +487,87 @@ def main() -> None:
     )
     parser.add_argument(
         '--no-catalog', action='store_true',
-        help='Skip catalog snapshot propagation (faster for candidate-only runs)'
+        help='Skip catalog snapshot propagation (real-TLE mode only)'
+    )
+    parser.add_argument(
+        '--synthetic', action='store_true',
+        help=(
+            'Propagate the Arnas 2021 synthetic Shell 3 constellation '
+            '(shell3_synthetic.tle, 1656 sats) using SatrecArray vectorisation. '
+            'Writes norad_id,timestep,x_km,y_km,z_km to propagated_candidates.csv '
+            '(OVERWRITES the real-TLE output file).'
+        )
+    )
+    parser.add_argument(
+        '--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
+        help=f'Satellites per SatrecArray call in --synthetic mode '
+             f'(default: {DEFAULT_BATCH_SIZE})'
     )
     args = parser.parse_args()
 
     duration_s = args.days * 86400.0
-    n_steps = int(duration_s / args.step) + 1
+    n_steps    = int(duration_s / args.step) + 1
 
+    # ======================================================================
+    # SYNTHETIC MODE
+    # ======================================================================
+    if args.synthetic:
+        print("=" * 68)
+        print("SGP4 Orbit Propagator — Arnas 2021 Synthetic Shell 3")
+        print(f"  Input      : {SYNTHETIC_TLE_PATH.name}")
+        print(f"  Duration   : {args.days} days  ({duration_s / 3600:.0f} h)")
+        print(f"  Timestep   : {args.step:.0f} s   ->  {n_steps:,} steps per satellite")
+        print(f"  Batch size : {args.batch_size} satellites per SatrecArray call")
+        print(f"  Output     : {OUTPUT_CANDIDATES.name}  (overwrites real-TLE file)")
+        print("=" * 68)
+
+        if not SYNTHETIC_TLE_PATH.exists():
+            print(f"\n  ERROR: {SYNTHETIC_TLE_PATH} not found.")
+            print("  Run 'python src/generate_candidates.py' first.")
+            return
+
+        # Count satellites before running
+        sat_records = load_tles(SYNTHETIC_TLE_PATH)
+        N = len(sat_records)
+        total_rows = N * n_steps
+        print(f"\n  Loaded         : {N:,} satellites  "
+              f"(NORAD {int(sat_records[0]['norad_id'])} .. "
+              f"{int(sat_records[-1]['norad_id'])})")
+        print(f"  Total rows     : {total_rows:,}  ({N:,} x {n_steps:,})")
+        print()
+
+        n_errors, alt_min, alt_max, elapsed = propagate_synthetic_vectorized(
+            SYNTHETIC_TLE_PATH,
+            OUTPUT_CANDIDATES,
+            args.days,
+            args.step,
+            batch_size=args.batch_size,
+        )
+
+        # ---------------------------------------------------------------
+        # Sanity checks
+        # ---------------------------------------------------------------
+        print()
+        print("=" * 68)
+        print("SANITY CHECKS")
+        print("=" * 68)
+        print(f"  SGP4 errors        : {n_errors}"
+              f"  ({'PASS - expect 0' if n_errors == 0 else 'FAIL - unexpected errors'})")
+        print(f"  Altitude range     : {alt_min:.1f} - {alt_max:.1f} km"
+              f"  ({'PASS' if 540 <= alt_min and alt_max <= 560 else 'WARN - outside 540-560 km'})"
+              f"  (expected ~548-552 km, nearly circular)")
+        print(f"  Computation time   : {elapsed:.1f} s")
+
+        file_size_mb = OUTPUT_CANDIDATES.stat().st_size / (1024 ** 2)
+        print(f"  Output file        : {OUTPUT_CANDIDATES}")
+        print(f"  File size          : {file_size_mb:.1f} MB  ({total_rows:,} rows)")
+        print("=" * 68)
+        print("Done.")
+        return
+
+    # ======================================================================
+    # DEFAULT MODE  (real TLEs, Owens-Fahrner 2025)
+    # ======================================================================
     print("=" * 65)
     print("SGP4 Orbit Propagator — Owens-Fahrner 2025")
     print(f"  Duration  : {args.days} days  ({duration_s / 3600:.0f} h)")

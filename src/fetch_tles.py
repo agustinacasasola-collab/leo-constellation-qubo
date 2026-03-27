@@ -51,11 +51,18 @@ MEAN_MOTION_MIN = 15.14   # lower bound (rev/day)
 MEAN_MOTION_MAX = 15.22   # upper bound (rev/day)
 
 # Inclination band centred on Shell 3 target of 30 deg (±5 deg)
-INCLINATION_MIN = 25.0    # deg
-INCLINATION_MAX = 35.0    # deg
+# NOTE: for the 100-candidate random-baseline validation (Table 5) the
+# inclination filter is disabled because only ~19 real objects exist at
+# <35 deg in the 550-km MEAN_MOTION band.  The full 754-object pool is used.
+INCLINATION_MIN = 20.0    # deg  (unused when FILTER_INCLINATION = False)
+INCLINATION_MAX = 42.0    # deg  (unused when FILTER_INCLINATION = False)
 
-# Number of candidates to download (exactly 20 per the paper)
-N_CANDIDATES = 20
+# Set True to restrict to the 30-deg inclination band (20-candidate run).
+# Set False to fetch from all inclinations (100-candidate random baseline).
+FILTER_INCLINATION = False
+
+# Number of candidates to download
+N_CANDIDATES = 100
 
 OUTPUT_PATH = Path(__file__).parent.parent / "data" / "shell_550km.tle"
 
@@ -121,10 +128,14 @@ def build_query_url(limit: int = N_CANDIDATES) -> str:
         "%Y-%m-%d"
     )
 
+    inc_segment = (
+        f"/INCLINATION/{INCLINATION_MIN}--{INCLINATION_MAX}"
+        if FILTER_INCLINATION else ""
+    )
     url = (
         f"{BASE_URL}/basicspacedata/query/class/gp"
         f"/MEAN_MOTION/{MEAN_MOTION_MIN}--{MEAN_MOTION_MAX}"
-        f"/INCLINATION/{INCLINATION_MIN}--{INCLINATION_MAX}"
+        f"{inc_segment}"
         f"/EPOCH/%3E{epoch_cutoff}"
         f"/orderby/NORAD_CAT_ID asc"
         f"/limit/{limit}"
@@ -216,9 +227,12 @@ def save_tles(tle_text: str, output_path: Path) -> int:
 def main() -> None:
     print("=" * 60)
     print("Space-Track TLE Fetcher — Shell 3 (550 km / 30 deg)")
-    print(f"  MEAN_MOTION : {MEAN_MOTION_MIN} – {MEAN_MOTION_MAX} rev/day")
-    print(f"  INCLINATION : {INCLINATION_MIN} – {INCLINATION_MAX} deg")
-    print(f"  Candidates  : {N_CANDIDATES}")
+    print(f"  MEAN_MOTION      : {MEAN_MOTION_MIN} - {MEAN_MOTION_MAX} rev/day")
+    if FILTER_INCLINATION:
+        print(f"  INCLINATION      : {INCLINATION_MIN} - {INCLINATION_MAX} deg")
+    else:
+        print("  INCLINATION      : all (filter disabled for 100-candidate baseline)")
+    print(f"  Candidates       : {N_CANDIDATES}")
     print("=" * 60)
 
     tle_text = fetch_tles(limit=N_CANDIDATES)
