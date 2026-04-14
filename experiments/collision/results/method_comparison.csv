@@ -1,0 +1,6 @@
+method,aggregate_pc,oom_vs_random,num_reads,feasibility_rate,sa_sqa_overlap
+Random,0.003691833,0.0,30,1.0,—
+SA (SimulatedAnnealingSampler),8.788842319040757e-05,1.623,50,1.0,4
+Tabu (TabuSampler),0.0004012130730972,0.964,50,1.0,—
+SQA (PathIntegralAnnealingSampler),2.226628421042598e-05,2.22,50,1.0,4
+Paper SA/QA (Owens-Fahrner 2025),4.84e-06,1.218,—,—,—

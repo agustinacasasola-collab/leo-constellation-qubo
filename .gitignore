@@ -58,6 +58,7 @@ data/
 # Results (keep .gitkeep)
 results/*.csv
 results/*.png
+experiments/**/results/*.png
 
 # OS
 .DS_Store

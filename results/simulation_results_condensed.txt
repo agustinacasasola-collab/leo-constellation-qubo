@@ -1,0 +1,47 @@
+=== EXPERIMENT 1 — COLLISION ===
+N candidates:     1656
+k selected:       100
+sigma:            0.1 km
+Pc=0 fraction:    85.7%
+
+Method     Best Pc      Mean Pc      OOM
+------     -------      -------      ---
+Random     3.69e-03     NOT AVAIL    --
+SA         8.79e-05     NOT AVAIL    +1.62
+SQA        2.23e-05     NOT AVAIL    +2.22
+Tabu       4.01e-04     NOT AVAIL    +0.96
+Hybrid     pending      pending      pending
+
+SA/SQA overlap (best runs): 4/100 satellites
+
+=== EXPERIMENT 2 — CONSTELLATION BI ===
+N candidates:     130
+k selected:       20
+sigma:            1.0 km
+Coverage band:    20N-50N
+Coverage ratio:   1.0000 (max/min) — all candidates identical
+
+Method     Best Pc      Mean Pc      OOM
+------     -------      -------      ---
+Random     2.08e-05     4.63e-05     --
+SA         7.37e-06     4.20e-05     +0.45
+SQA        2.29e-05     6.84e-05     -0.04
+QPU        pending      pending      pending
+
+Best lambda (SA): 0.3  (best_pc = 7.37e-06)
+SA/SQA overlap (best runs): 1/20 satellites
+
+Lambda sweep:
+  lambda    SA best Pc    SQA best Pc
+  ------    ----------    -----------
+  0.3       7.37e-06      2.39e-05
+  0.5       2.52e-05      3.31e-05
+  0.7       1.89e-05      2.91e-05
+  0.9       1.34e-05      2.66e-05
+  1.0       1.39e-05      1.96e-05
+
+=== CROSS-EXPERIMENT ===
+SA OOM:   Exp1 +1.62  vs  Exp2 +0.45
+SQA OOM:  Exp1 +2.22  vs  Exp2 -0.04
+Pc=0:     Exp1  85.7%  vs  Exp2  0.8%
+Pc range: Exp1 [1.11e-16, 4.68e-03]  vs  Exp2 [1.22e-15, 4.89e-05]

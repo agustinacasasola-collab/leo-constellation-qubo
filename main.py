@@ -271,7 +271,7 @@ def main() -> None:
     rng = np.random.default_rng(0)
     trial_pcs = []
     all_pcs = satellites_df['pc'].values.astype(float)
-    for seed in range(30):
+    for seed in range(num_reads):
         idx = np.random.default_rng(seed).choice(len(satellites_df), k, replace=False)
         pc_k = all_pcs[idx]
         log_s = np.sum(np.log1p(-pc_k))
@@ -295,7 +295,7 @@ def main() -> None:
     print("=" * 72)
     print(f"  {'Solver':<32} {'Aggregate Pc':>14}  {'vs Random':>10}  {'Paper':>10}")
     print(f"  {'-'*32} {'-'*14}  {'-'*10}  {'-'*10}")
-    print(f"  {'Random baseline (mean, 30 trials)':<32} {pc_random:>14.4e}  "
+    print(f"  {f'Random baseline (mean, {num_reads} trials)':<32} {pc_random:>14.4e}  "
           f"{'1.00x':>10}  {paper_random:>10.2e}")
     print(f"  {'SA (SimulatedAnnealingSampler)':<32} {pc_sa:>14.4e}  "
           f"{_ratio(pc_sa, pc_random):>9.2f}x  {paper_optimised:>10.2e}")

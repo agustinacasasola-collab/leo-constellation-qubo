@@ -1,0 +1,4 @@
+method,best_aggregate_pc,mean_aggregate_pc,std_aggregate_pc,best_gs_violations,n_feasible_runs
+Random,1.1994957426010417e-174,8.5598360859164e-51,,0,
+SA,,,,-1,0.0
+SQA,,,,-1,0.0
